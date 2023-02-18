@@ -1,14 +1,10 @@
 from __future__ import unicode_literals
-#comment
 
-import os
 import threading
 import time
+import csv
 
-import discovery
-import roonapisocket
-
-from constants import (
+from .constants import (
     LOGGER,
     PAGE_SIZE,
     SERVICE_BROWSE,
@@ -16,32 +12,19 @@ from constants import (
     SERVICE_TRANSPORT,
     CONTROL_VOLUME,
 )
+from .roonapisocket import RoonApiWebSocket
 
 
 def split_media_path(path):
     """Split a path (eg path/to/media) into a list for use by play_media."""
 
-    allparts = []
-    while 1:
-        parts = os.path.split(path)
-        if parts[0] == path:  # sentinel for absolute paths
-            allparts.insert(0, parts[0])
-            break
-
-        if parts[1] == path:  # sentinel for relative paths
-            allparts.insert(0, parts[1])
-            break
-
-        path = parts[0]
-        allparts.insert(0, parts[1])
-    return allparts
+    return [*csv.reader([path], delimiter="/")][0]
 
 
-class RoonApi:  # pylint: disable=too-many-instance-attributes
+class RoonApi:  # pylint: disable=too-many-instance-attributes, too-many-lines
     """Class to handle talking to the roon server."""
 
     _roonsocket = None
-    _roondiscovery = None
     _host = None
     _core_id = None
     _core_name = None
@@ -56,7 +39,6 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes
 
     _volume_controls_request_id = None
     _volume_controls = {}
-    _state_callbacks = []
 
     @property
     def token(self):
@@ -67,11 +49,6 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes
     def host(self):
         """Return the roon host."""
         return self._host
-
-    @property
-    def port(self):
-        """Return the roon port."""
-        return self._port
 
     @property
     def core_id(self):
@@ -260,15 +237,93 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes
         data = {"output_id": output_id, "how": how}
         return self._request(SERVICE_TRANSPORT + "/mute", data)
 
-    def change_volume(self, output_id, value, method="absolute"):
+    def set_volume_percent(self, output_id, absolute_value):
         """
-        Change the volume of an output.
+        Set the volume of an output to a 0-100 value.
 
-        For convenience you can always just give the new volume level as percentage.
+        Roon endpoints have a few different volume scales - this method scales from 0-100
+        to what the endpoint needs.
 
         params:
             output_id: the id of the output
-            value: The new volume value, or the increment value or step (as percentage)
+        """
+        volume_data = self._outputs[output_id].get("volume")
+
+        if volume_data is None:
+            LOGGER.info("This endpoint has fixed volume.")
+            return None
+
+        volume_max = volume_data["max"]
+        volume_min = volume_data["min"]
+        volume_range = volume_max - volume_min
+        volume_percentage_factor = volume_range / 100
+        percentage_volume = volume_min + absolute_value * volume_percentage_factor
+        return self.change_volume_raw(output_id, percentage_volume)
+
+    def change_volume_percent(self, output_id, relative_value):
+        """
+
+        Change the volume of an output by a relative amount.
+
+        Roon endpoints have a few different volume scales - this method scales from 0-100
+        to what the endpoint needs.
+
+        params:
+            output_id: the id of the output
+            relative_value: How much to increase or decrease the volume
+        """
+        volume_data = self._outputs[output_id].get("volume")
+
+        if volume_data is None:
+            LOGGER.info("This endpoint has fixed volume.")
+            return None
+
+        volume_max = volume_data["max"]
+        volume_min = volume_data["min"]
+        volume_range = volume_max - volume_min
+        volume_percentage_factor = volume_range / 100
+
+        volume_percentage_change = int(round(relative_value * volume_percentage_factor))
+        return self.change_volume_raw(output_id, volume_percentage_change, "relative")
+
+    def get_volume_percent(self, output_id):
+        """
+
+        Get the volume of an output.
+
+        Roon endpoints have a few different volumee scales - this method scales from 0-100
+        to what the endpoint needs.
+
+        params:
+            output_id: the id of the output
+            relative_value: How much to increase or decrease the volume
+        """
+
+        volume_data = self._outputs[output_id].get("volume")
+
+        if volume_data is None:
+            LOGGER.info("This endpoint has fixed volume.")
+            return None
+
+        volume_max = volume_data["max"]
+        volume_min = volume_data["min"]
+        volume_range = volume_max - volume_min
+        volume_percentage_factor = volume_range / 100
+
+        raw_level = float(volume_data["value"])
+        percent_level = (raw_level - volume_min) / volume_percentage_factor
+        return int(round(percent_level))
+
+    def change_volume_raw(self, output_id, value, method="absolute"):
+        """
+        Change the volume of an output.
+
+        Roon endpoint have a few different scales - this endpoints just used the native scale.
+        The percent calls may be easier to use
+
+        params:
+            output_id: the id of the output
+            value: The new volume value, or the increment value or step
             method: How to interpret the volume ('absolute'|'relative'|'relative_step')
         """
         if "volume" not in self._outputs[output_id]:
@@ -277,9 +332,6 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes
         # Home assistant was catching this - so catch here
         # to try and diagnose what needs to be checked.
         try:
-            if method == "absolute":
-                if self._outputs[output_id]["volume"]["type"] == "db":
-                    value = int((float(value) / 100) * 80) - 80
             data = {"output_id": output_id, "how": method, "value": value}
             return self._request(SERVICE_TRANSPORT + "/change_volume", data)
         except Exception as exc:  # pylint: disable=broad-except
@@ -381,7 +433,7 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes
             id_filter = [id_filter]
         self._state_callbacks.append((callback, event_filter, id_filter))
 
-    def register_queue_callback(self, callback, zone_or_output_id):
+    def register_queue_callback(self, callback, zone_or_output_id=""):
         """
         Subscribe to queue change events.
 
@@ -391,7 +443,7 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes
         if zone_or_output_id:
             opt_data = {"zone_or_output_id": zone_or_output_id}
         else:
-            opt_data = ""
+            opt_data = None
         self._roonsocket.subscribe(SERVICE_TRANSPORT, "queue", callback, opt_data)
 
     def browse_browse(self, opts):
@@ -400,7 +452,6 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes
 
         reference: https://github.com/RoonLabs/node-roon-api-browse/blob/master/lib.js
         """
-        # time.sleep(16) # this is for testing REMOVE IT FOR PRODUCTION
         return self._request(SERVICE_BROWSE + "/browse", opts)
 
     def browse_load(self, opts):
@@ -411,7 +462,90 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes
         """
         return self._request(SERVICE_BROWSE + "/load", opts)
 
-    def play_media(self, zone_or_output_id, path, action=None):
+    def list_media(self, zone_or_output_id, path):
+        """
+        List the media specified.
+
+        params:
+            zone_or_output_id: where to play the media
+            path: a list allowing roon to find the media
+                  eg ["Library", "Artists", "Neil Young", "Harvest"] or ["My Live Radio", "BBC Radio 4"]
+        """
+
+        opts = {
+            "zone_or_output_id": zone_or_output_id,
+            "hierarchy": "browse",
+            "count": PAGE_SIZE,
+            "pop_all": True,
+        }
+
+        total_count = self.browse_browse(opts)["list"]["count"]
+        del opts["pop_all"]
+
+        load_opts = {
+            "zone_or_output_id": zone_or_output_id,
+            "hierarchy": "browse",
+            "count": PAGE_SIZE,
+            "offset": 0,
+        }
+        items = []
+        searchterm = path[-1]
+        path.pop()
+        for element in path:
+            load_opts["offset"] = 0
+            found = None
+            searched = 0
+
+            LOGGER.debug("Looking for %s", element)
+            while searched < total_count and found is None:
+                items = self.browse_load(load_opts)["items"]
+
+                for item in items:
+                    searched += 1
+                    if item["title"] == element:
+                        found = item
+                        break
+
+                load_opts["offset"] += PAGE_SIZE
+            if searched >= total_count and found is None:
+                LOGGER.debug(
+                    "Could not find media path element '%s' in %s",
+                    element,
+                    [item["title"] for item in items],
+                )
+                return None
+
+            opts["item_key"] = found["item_key"]
+            load_opts["item_key"] = found["item_key"]
+
+            total_count = self.browse_browse(opts)["list"]["count"]
+
+            load_opts["offset"] = 0
+            items = self.browse_load(load_opts)["items"]
+
+        LOGGER.debug("Searching for %s", searchterm)
+        load_opts["offset"] = 0
+        searched = 0
+        matched = []
+        while searched < total_count:
+            items = self.browse_load(load_opts)["items"]
+
+            if searchterm == "__all__":
+                for item in items:
+                    searched += 1
+                    matched.append(item["title"])
+            else:
+                for item in items:
+                    searched += 1
+                    if searchterm in item["title"]:
+                        matched.append(item["title"])
+
+            load_opts["offset"] += PAGE_SIZE
+
+        return matched
+
+    def play_media(self, zone_or_output_id, path, action=None, report_error=True):
+        # pylint: disable=too-many-locals,too-many-branches
         """
         Play the media specified.
 
@@ -457,11 +591,12 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes
 
                 load_opts["offset"] += PAGE_SIZE
             if searched >= total_count and found is None:
-                LOGGER.error(
-                    "Could not find media path element '%s' in %s",
-                    element,
-                    [item["title"] for item in items],
-                )
+                if report_error:
+                    LOGGER.error(
+                        "Could not find media path element '%s' in %s",
+                        element,
+                        [item["title"] for item in items],
+                    )
                 return None
 
             opts["item_key"] = found["item_key"]
@@ -595,47 +730,57 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes
     # private methods
     # pylint: disable=too-many-arguments
     def __init__(
-            self,
-            appinfo,
-            token=None,
-            host=None,
-            port=9100,
-            blocking_init=True,
-            core_id=None,
+        self,
+        appinfo,
+        token,
+        host,
+        port,
+        blocking_init=True,
     ):
         """
         Set up the connection with Roon.
 
         appinfo: a dict of the required information about the app that should be connected to the api
         token: used for presistant storage of the auth token, will be set to token attribute if retrieved. You should handle saving of the key yourself
-        host: optional the ip or hostname of the Roon server, will be auto discovered if ommitted
-        port: optional the http port of the Roon websockets api. Should be default of 9100
+        host: the ip or hostname of the Roon server,
+        port: the http port of the Roon websockets api.
         blocking_init: By default the init will halt untill the socket is connected and the app is authenticated,
                        if you set bool to False the init will continue but you will only receive data once the connection is fully initialized.
                        The latter is preferred if you're (only) using the callbacks
         """
         self._appinfo = appinfo
         self._token = token
+
         if not appinfo or not isinstance(appinfo, dict):
             raise "appinfo missing or in incorrect format!"
 
-        if host and port:
-            self._server_discovered(host, port)
-        else:
-            self._roondiscovery = RoonDiscovery(self._server_discovered, core_id)
-            self._roondiscovery.start()
+        if not (host and port):
+            raise "host and port of the roon core must be specified!"
+
+        self._server_setup(host, port)
+
         # block untill we're ready
         if blocking_init:
             while not self.ready and not self._exit:
-                time.sleep(1)
+                time.sleep(0.05)
+
+        # fill zones and outputs dicts one time so the data is available right away
+        # This might not be needed as the on change callback may have already done this
+        if self.token:
+            if not self._zones:
+                self._zones = self._get_zones()
+            if not self._outputs:
+                self._outputs = self._get_outputs()
+
         # start socket watcher
         thread_id = threading.Thread(target=self._socket_watcher)
         thread_id.daemon = True
         thread_id.start()
+        LOGGER.debug("Finished Roonapi Init")
 
     # pylint: disable=redefined-builtin
     def __exit__(self, type, value, exc_tb):
-        """Stop socket and discovery on exit."""
+        """Stop socket on exit."""
         self.stop()
 
     def __enter__(self):
@@ -643,30 +788,30 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes
         return self
 
     def stop(self):
-        """Stop socket and discovery."""
+        """Stop socket."""
         self._exit = True
-        if self._roondiscovery:
-            self._roondiscovery.stop()
         if self._roonsocket:
             self._roonsocket.stop()
 
-    def _server_discovered(self, host, port):
-        """(Auto) discovered the roon server on the network."""
-        LOGGER.info("Connecting to Roon server %s:%s" % (host, port))
+    def _server_setup(self, host, port):
+        """Open the roon socket connection to the roon server on the network."""
+        LOGGER.debug("Connecting to Roon server %s:%s" % (host, port))
         ws_address = "ws://%s:%s/api" % (host, port)
         self._host = host
         self._port = port
-        self._roonsocket = roonapisocket.RoonApiWebSocket(ws_address)
+        self._roonsocket = RoonApiWebSocket(ws_address)
 
         self._roonsocket.register_connected_callback(self._socket_connected)
         self._roonsocket.register_registered_calback(self._server_registered)
-        self._roonsocket.register_volume_controls_callback(self._on_volume_control_request)
+        self._roonsocket.register_volume_controls_callback(
+            self._on_volume_control_request
+        )
 
         self._roonsocket.start()
 
     def _socket_connected(self):
         """Successfully connected the websocket."""
-        LOGGER.info("Connection with roon websockets (re)created.")
+        LOGGER.debug("Connection with roon websockets (re)created.")
         self.ready = False
         self._volume_controls_request_id = None
         # authenticate / register
@@ -679,22 +824,17 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes
         if not self._token:
             LOGGER.info("The application should be approved within Roon's settings.")
         else:
-            LOGGER.info("Confirming previous registration with Roon...")
+            LOGGER.debug("Confirming previous registration with Roon...")
         self._roonsocket.send_request(SERVICE_REGISTRY + "/register", appinfo)
 
     def _server_registered(self, reginfo):
-        LOGGER.info("Registered to Roon server %s", reginfo["display_name"])
+        LOGGER.debug("Registered to Roon server %s", reginfo["display_name"])
         LOGGER.debug(reginfo)
         self._token = reginfo["token"]
         self._core_id = reginfo["core_id"]
         self._core_name = reginfo["display_name"]
-
-        # fill zones and outputs dicts one time so the data is available right away
-        if not self._zones:
-            self._zones = self._get_zones()
-        if not self._outputs:
-            self._outputs = self._get_outputs()
         # subscribe to state change events
+
         self._roonsocket.subscribe(SERVICE_TRANSPORT, "zones", self._on_state_change)
         self._roonsocket.subscribe(SERVICE_TRANSPORT, "outputs", self._on_state_change)
         # set flag that we're fully initialized (used for blocking init)
@@ -707,6 +847,7 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes
         if not msg or not isinstance(msg, dict):
             return
         for state_key, state_values in msg.items():
+            LOGGER.debug("_on_state_change %s", state_key)
             changed_ids = []
             filter_keys = []
             if state_key in [
@@ -766,7 +907,7 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes
                     callback(event, changed_ids)
                 # pylint: disable=broad-except
                 except Exception:
-                    LOGGER.warning("Error while executing callback. ")
+                    LOGGER.exception("Error while executing callback!")
 
     def _get_outputs(self):
         outputs = {}
@@ -786,6 +927,7 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes
 
     def _request(self, command, data=None):
         """Send command and wait for result."""
+        LOGGER.debug("_request: command: %s", command)
         if not self._roonsocket:
             retries = 20
             while (not self.ready or not self._roonsocket) and retries:
@@ -795,14 +937,22 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes
                 LOGGER.warning("socket is not yet ready")
                 if not self._roonsocket:
                     return None
+        LOGGER.debug("_request: sending")
         request_id = self._roonsocket.send_request(command, data)
         result = None
         retries = 50
         while retries:
             result = self._roonsocket.results.get(request_id)
+            LOGGER.debug(
+                "request: command: %s, retry: %d, success: %s",
+                command,
+                retries,
+                result is not None,
+            )
             if result:
                 break
             retries -= 1
+
             time.sleep(0.05)
         try:
             del self._roonsocket.results[request_id]
@@ -820,12 +970,22 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes
                     count += 1
                     time.sleep(1)
                 if not self._exit:
-                    self._server_discovered(self._host, self._port)
+                    self._server_setup(self._host, self._port)
             time.sleep(2)
 
-    def register_volume_control(self, control_key, display_name, callback, initial_volume=0, volume_type="number",
-                                volume_step=2, volume_min=0, volume_max=100, is_muted=False):
-        ''' register a new volume control on the api'''
+    def register_volume_control(
+        self,
+        control_key,
+        display_name,
+        callback,
+        initial_volume=0,
+        volume_type="number",
+        volume_step=2,
+        volume_min=0,
+        volume_max=100,
+        is_muted=False,
+    ):
+        """Register a new volume control on the api."""
         if control_key in self._volume_controls:
             LOGGER.error("source_control %s is already registered!" % control_key)
             return
@@ -837,7 +997,7 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes
             "volume_value": initial_volume,
             "volume_step": volume_step,
             "is_muted": is_muted,
-            "control_key": control_key
+            "control_key": control_key,
         }
         self._volume_controls[control_key] = (callback, control_data)
         if self._volume_controls_request_id:
@@ -845,27 +1005,28 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes
             self._roonsocket.send_continue(self._volume_controls_request_id, data)
 
     def update_volume_control(self, control_key, volume=None, mute=None):
-        ''' update an existing volume control, report its state to Roon '''
+        """Update an existing volume control, report its state to Roon."""
         if control_key not in self._volume_controls:
             LOGGER.warning("volume_control %s is not (yet) registered!" % control_key)
-            return
+            return False
         if not self._volume_controls_request_id:
             LOGGER.warning("Not yet registered, can not update volume control")
             return False
-        if volume != None:
+        if volume is not None:
             self._volume_controls[control_key][1]["volume_value"] = volume
-        if mute != None:
+        if mute is not None:
             self._volume_controls[control_key][1]["is_muted"] = mute
         data = {"controls_changed": [self._volume_controls[control_key][1]]}
         self._roonsocket.send_continue(self._volume_controls_request_id, data)
+        return True
 
     def _on_volume_control_request(self, event, request_id, data):
-        ''' got request from roon server for a volume control registered on this endpoint'''
+        """Got request from roon server for a volume control registered on this endpoint."""
         if event == "subscribe_controls":
             LOGGER.debug("found subscription ID for volume controls: %s " % request_id)
             # send all volume controls already registered (handle connection loss)
             controls = []
-            for callback, control_data in self._volume_controls.values():
+            for _, control_data in self._volume_controls.values():
                 controls.append(control_data)
             self._roonsocket.send_continue(request_id, {"controls_added": controls})
             self._volume_controls_request_id = request_id
@@ -874,9 +1035,14 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes
             if event == "set_volume" and data["mode"] == "absolute":
                 value = data["value"]
             elif event == "set_volume" and data["mode"] == "relative":
-                value = self._volume_controls[control_key][1]["volume_value"] + data["value"]
+                value = (
+                    self._volume_controls[control_key][1]["volume_value"]
+                    + data["value"]
+                )
             elif event == "set_volume" and data["mode"] == "relative_step":
-                value = self._volume_controls[control_key][1]["volume_value"] + (data["value"] * data["volume_step"])
+                value = self._volume_controls[control_key][1]["volume_value"] + (
+                    data["value"] * data["volume_step"]
+                )
             elif event == "set_mute":
                 value = data["mode"] == "on"
             else:
@@ -884,6 +1050,6 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes
             try:
                 self._roonsocket.send_complete(request_id, "Success")
                 self._volume_controls[control_key][0](control_key, event, value)
-            except Exception:
+            except Exception:  # pylint: disable=broad-except
                 LOGGER.exception("Error in volume_control callback")
                 self._roonsocket.send_complete(request_id, "Error")
