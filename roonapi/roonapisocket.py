@@ -4,7 +4,7 @@ import threading
 
 import websocket
 
-from .constants import LOGGER, REGISTERED, SERVICE_PING, CONTROL_VOLUME
+from constants import LOGGER, REGISTERED, SERVICE_PING, CONTROL_VOLUME, CONTROL_SOURCE
 
 try:
     import simplejson as json
@@ -156,6 +156,12 @@ class RoonApiWebSocket(
                 LOGGER.debug("CONTROL_VOLUME endpoint %s", event)
                 if self._volume_controls_callback:
                     self._volume_controls_callback(event, request_id, body)
+            elif CONTROL_SOURCE in header:
+                # incoming message for CONTROL_SOURCE endpoint
+                event = header.split("/")[-1]
+                LOGGER.debug("CONTROL_SOURCE endpoint %s", event)
+                if self._source_controls_callback:
+                    self._source_controls_callback(event, request_id, body)
             elif request_id in self._subscriptions:
                 # this is callback for one of our subscriptions
                 self._subscriptions[request_id]["callback"](body)

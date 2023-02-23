@@ -4,15 +4,16 @@ import threading
 import time
 import csv
 
-from .constants import (
+from constants import (
     LOGGER,
     PAGE_SIZE,
     SERVICE_BROWSE,
     SERVICE_REGISTRY,
     SERVICE_TRANSPORT,
     CONTROL_VOLUME,
+    CONTROL_SOURCE
 )
-from .roonapisocket import RoonApiWebSocket
+from roonapisocket import RoonApiWebSocket
 
 
 def split_media_path(path):
@@ -39,6 +40,8 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes, too-many-lines
 
     _volume_controls_request_id = None
     _volume_controls = {}
+    _source_controls_request_id = None
+    _source_controls = {}
 
     @property
     def token(self):
@@ -803,10 +806,8 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes, too-many-lines
 
         self._roonsocket.register_connected_callback(self._socket_connected)
         self._roonsocket.register_registered_calback(self._server_registered)
-        self._roonsocket.register_volume_controls_callback(
-            self._on_volume_control_request
-        )
-
+        self._roonsocket.register_volume_controls_callback(self._on_volume_control_request)
+        self._roonsocket.register_source_controls_callback(self._on_source_control_request)
         self._roonsocket.start()
 
     def _socket_connected(self):
@@ -814,11 +815,12 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes, too-many-lines
         LOGGER.debug("Connection with roon websockets (re)created.")
         self.ready = False
         self._volume_controls_request_id = None
+        self._source_controls_request_id = None
         # authenticate / register
         # warning: at first launch the user has to approve the app in the Roon settings.
         appinfo = self._appinfo.copy()
         appinfo["required_services"] = [SERVICE_TRANSPORT, SERVICE_BROWSE]
-        appinfo["provided_services"] = [CONTROL_VOLUME]
+        appinfo["provided_services"] = [CONTROL_VOLUME, CONTROL_SOURCE]
         if self._token:
             appinfo["token"] = self._token
         if not self._token:
@@ -1052,4 +1054,46 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes, too-many-lines
                 self._volume_controls[control_key][0](control_key, event, value)
             except Exception:  # pylint: disable=broad-except
                 LOGGER.exception("Error in volume_control callback")
+                self._roonsocket.send_complete(request_id, "Error")
+
+    def register_source_control(
+        self,
+        control_key,
+        display_name,
+        callback,
+	    supports_standby,
+	    status
+    ):
+        """Register a new volume control on the api."""
+        if control_key in self._source_controls:
+            LOGGER.error("source_control %s is already registered!" % control_key)
+            return
+        control_data = {
+            "display_name": display_name,
+            "supports_standby": supports_standby,
+            "status": status,
+            "control_key": control_key,
+        }
+        self._source_controls[control_key] = (callback, control_data)
+        if self._source_controls_request_id:
+            data = {"controls_added": [control_data]}
+            self._roonsocket.send_continue(self._source_controls_request_id, data)
+
+    def _on_source_control_request(self, event, request_id, data):
+        """Got request from roon server for a volume control registered on this endpoint."""
+        if event == "subscribe_controls":
+            LOGGER.debug("found subscription ID for source controls: %s " % request_id)
+            # send all volume controls already registered (handle connection loss)
+            controls = []
+            for _, control_data in self._volume_controls.values():
+                controls.append(control_data)
+            self._roonsocket.send_continue(request_id, {"controls_added": controls})
+            self._source_controls_request_id = request_id
+        elif data and data.get("control_key"):
+            control_key = data["control_key"]
+            try:
+                self._roonsocket.send_complete(request_id, "Success")
+                self._source_controls[control_key][0](control_key, event, data)
+            except Exception:  # pylint: disable=broad-except
+                LOGGER.exception("Error in source_control callback")
                 self._roonsocket.send_complete(request_id, "Error")
