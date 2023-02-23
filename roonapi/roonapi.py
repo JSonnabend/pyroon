@@ -1066,7 +1066,7 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes, too-many-lines
             return False
         if state is not None:
             self._source_controls[control_key][1]["status"] = state
-        data = {"controls_changed": [self._source_controls[control_key][1]]}
+        data = {"controls_changed": self._source_controls[control_key][1]}
         self._roonsocket.send_continue(self._source_controls_request_id, data)
         return True
 
