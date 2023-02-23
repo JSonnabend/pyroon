@@ -1012,7 +1012,7 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes, too-many-lines
             LOGGER.warning("volume_control %s is not (yet) registered!" % control_key)
             return False
         if not self._volume_controls_request_id:
-            LOGGER.warning("Not yet registered, can not update volume control")
+            LOGGER.warning("Not yet registered, cannot update volume control")
             return False
         if volume is not None:
             self._volume_controls[control_key][1]["volume_value"] = volume
@@ -1055,6 +1055,20 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes, too-many-lines
             except Exception:  # pylint: disable=broad-except
                 LOGGER.exception("Error in volume_control callback")
                 self._roonsocket.send_complete(request_id, "Error")
+
+    def update_source_control(self, control_key, state=None):
+        """Update an existing source control, report its state to Roon."""
+        if control_key not in self._source_controls:
+            LOGGER.warning("source_control %s is not (yet) registered!" % control_key)
+            return False
+        if not self._source_controls_request_id:
+            LOGGER.warning("Not yet registered, cannot update source control")
+            return False
+        if state is not None:
+            self._source_controls[control_key][1]["status"] = state
+        data = {"controls_changed": [self._source_controls[control_key][1]]}
+        self._roonsocket.send_continue(self._source_controls_request_id, data)
+        return True
 
     def register_source_control(
         self,
